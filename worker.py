@@ -24,6 +24,7 @@ import gc
 import glob
 import json
 import time
+import threading
 import argparse
 
 # Route any library prints to stderr so stdout is a clean protocol channel.
@@ -37,9 +38,23 @@ if ACESTEP_DIR not in sys.path:
     sys.path.insert(0, ACESTEP_DIR)
 
 
+_emit_lock = threading.Lock()
+
+
 def emit(obj):
-    _real_stdout.write("@@" + json.dumps(obj) + "\n")
-    _real_stdout.flush()
+    with _emit_lock:
+        _real_stdout.write("@@" + json.dumps(obj) + "\n")
+        _real_stdout.flush()
+
+
+def _progress(value, desc=None):
+    """Forward the engine's progress (ratio, desc) to the UI as a protocol event.
+    Called from the engine's diffusion-progress thread, ~every 0.5s."""
+    try:
+        emit({"event": "progress", "ratio": float(value),
+              "desc": desc if isinstance(desc, str) else None})
+    except Exception:
+        pass
 
 
 def main():
@@ -156,7 +171,7 @@ def main():
             save_dir = req.get("save_dir")
 
             gt0 = time.time()
-            generate_music(dit, llm, params, config, save_dir=save_dir)
+            generate_music(dit, llm, params, config, save_dir=save_dir, progress=_progress)
             gen_time = time.time() - gt0
 
             files = []

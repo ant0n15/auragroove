@@ -297,8 +297,9 @@ def _worker_rss_gb():
         return None
 
 
-def _read_event(proc):
-    """Read worker stdout until a @@-prefixed JSON protocol line; return dict."""
+def _read_event(proc, on_progress=None):
+    """Read worker stdout until a terminal @@-event; forward 'progress' events to
+    on_progress(ratio, desc) and keep reading. Returns the terminal event dict."""
     while True:
         line = proc.stdout.readline()
         if line == "":
@@ -306,9 +307,17 @@ def _read_event(proc):
         line = line.strip()
         if line.startswith("@@"):
             try:
-                return json.loads(line[2:])
+                ev = json.loads(line[2:])
             except Exception:
                 return {"event": "error", "msg": "bad protocol line"}
+            if ev.get("event") == "progress":
+                if on_progress:
+                    try:
+                        on_progress(ev.get("ratio"), ev.get("desc"))
+                    except Exception:
+                        pass
+                continue
+            return ev
         # ignore stray stdout
 
 
@@ -382,7 +391,7 @@ def _ensure_worker(model, vae="official", lm="none", offload=True):
     return ev.get("load_time", time.time() - t0)
 
 
-def _worker_generate(cfg, model, vae="official", lm="none"):
+def _worker_generate(cfg, model, vae="official", lm="none", on_progress=None):
     global _worker, _worker_gens, _worker_baseline_rss
     with _worker_lock:
         try:
@@ -397,7 +406,7 @@ def _worker_generate(cfg, model, vae="official", lm="none"):
             return {"ok": False, "msg": f"failed to send request: {e}"}
 
         _set_active(_worker)
-        ev = _read_event(_worker)
+        ev = _read_event(_worker, on_progress=on_progress)
         _set_active(None)
         _worker_gens += 1
         rss = _worker_rss_gb()
@@ -448,7 +457,7 @@ def _worker_generate(cfg, model, vae="official", lm="none"):
         }
 
 
-def _worker_generate_n(cfg, model, vae, lm, n, run_dir):
+def _worker_generate_n(cfg, model, vae, lm, n, run_dir, on_item_progress=None):
     """Run N sequential single-item generations (batch>1 won't fit in VRAM next
     to the resident model on 8GB, so we loop instead). Aggregates the results."""
     files, load_time, gen_time, last = [], None, 0.0, None
@@ -456,7 +465,8 @@ def _worker_generate_n(cfg, model, vae, lm, n, run_dir):
         sub = dict(cfg)
         sub["batch_size"] = 1
         sub["save_dir"] = str(run_dir / f"item_{k}")
-        r = _worker_generate(sub, model, vae=vae, lm=lm)
+        cb = (lambda r, d, _k=k: on_item_progress(_k, r, d)) if on_item_progress else None
+        r = _worker_generate(sub, model, vae=vae, lm=lm, on_progress=cb)
         if not r.get("ok"):
             if files:
                 break  # partial success: keep what we have
@@ -606,16 +616,17 @@ def generate(
     use_adg, cfg_interval_start, cfg_interval_end,
     velocity_norm_threshold, velocity_ema_factor,
     cot_metas, cot_language, vae,
-    progress=gr.Progress(),
 ):
     global _stop_requested
     _stop_requested = False
+    keep = [gr.update()] * MAX_OUTPUTS          # leave the players untouched while running
     caption = (caption or "").strip()
     lyrics = (lyrics or "").strip()
     if instrumental:
         lyrics = "[Instrumental]"
     if not caption and (not lyrics or lyrics == "[Instrumental]"):
-        return (*_audio_outputs([]), "❌ Please enter a caption (and/or lyrics).")
+        yield (*_audio_outputs([]), "❌ Please enter a caption (and/or lyrics).")
+        return
 
     run_dir = OUT_ROOT / f"run_{int(time.time())}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -631,7 +642,6 @@ def generate(
         cot_metas, cot_language, vae,
     )
     cfg["save_dir"] = str(run_dir)
-
     _write_config(cfg, cfg_path)
 
     # Think uses the selected LM (resident); Think off loads no LM (more VRAM).
@@ -639,26 +649,71 @@ def generate(
     n_out = max(1, min(int(batch_size), MAX_OUTPUTS))
     fresh_load = (_worker is None or _worker.poll() is not None
                   or _worker_model != model or _worker_vae != vae or _worker_lm != lm_sel)
-    if fresh_load:
-        desc = "Model was not loaded on GPU, this may take longer…"
-    elif n_out > 1:
-        desc = f"Generating {n_out} outputs…"
-    else:
-        desc = "Generating…"
-    progress(0.05, desc=desc)
-    res = _worker_generate_n(cfg, model, vae, lm_sel, n_out, run_dir)
+    base = ("Loading model to GPU, this may take some time…" if fresh_load
+            else (f"Generating {n_out} outputs…" if n_out > 1 else "Generating…"))
+
+    # Progress is shown ONLY in the Status box (not over the audio players). We run
+    # the worker in a thread and stream the engine's real, self-calibrating progress
+    # (ratio ~0.5..1.0 per output) as text via yielded status updates.
+    # `real` = last fraction the engine actually reported (None until generation
+    # starts, e.g. during model load). `shown` is what we display: it snaps up to
+    # real milestones and gently crawls toward the next one in between, so the bar
+    # always moves (during load and the LM's fixed-step phases) but never reverses.
+    state = {"real": None, "label": base, "res": None, "shown": 0.03}
+
+    def _on_item_progress(k, ratio, d):
+        # Engine ratios span the whole pipeline: ~0.1 (CoT) -> 0.5 (audio codes)
+        # -> 0.52..0.79 (diffusion) -> ~1.0 (decode), so use them directly.
+        try:
+            r = float(ratio)
+        except (TypeError, ValueError):
+            return
+        state["real"] = (k + max(0.0, min(1.0, r))) / n_out
+        if d:
+            state["label"] = d
+        elif n_out > 1:
+            state["label"] = f"Generating output {k + 1}/{n_out}…"
+        else:
+            state["label"] = "Generating…"
+
+    th = threading.Thread(
+        target=lambda: state.update(
+            res=_worker_generate_n(cfg, model, vae, lm_sel, n_out, run_dir,
+                                   on_item_progress=_on_item_progress)),
+        daemon=True,
+    )
+    th.start()
+    while th.is_alive():
+        real, shown = state["real"], state["shown"]
+        if real is not None and real > shown:
+            shown = real                                   # snap up to a real milestone
+        else:
+            # crawl toward a soft cap so the bar keeps moving; never go backward
+            cap = 0.35 if real is None else min(0.985, real + 0.10)
+            if cap > shown:
+                shown += (cap - shown) * 0.05              # ~6s ease toward the cap
+        state["shown"] = max(0.0, min(0.99, shown))
+        pct = int(round(state["shown"] * 100))
+        yield (*keep, f"⏳ {state['label']}  {pct}%")
+        th.join(timeout=0.3)
+    res = state["res"] or {"ok": False, "msg": "worker returned no result"}
 
     if not res.get("ok"):
         shutil.rmtree(run_dir, ignore_errors=True)
         if _stop_requested:
-            return (*_audio_outputs([]), "🛑 Generation stopped. (Worker was terminated; next run reloads the model.)")
+            yield (*_audio_outputs([]), "🛑 Generation stopped. (Worker was terminated; next run reloads the model.)")
+            return
         tail = res.get("trace") or res.get("log_tail") or ""
-        return (*_audio_outputs([]), f"❌ {res.get('msg', 'no audio produced')}\n\n{tail[-1500:]}")
+        yield (*_audio_outputs([]), f"❌ {res.get('msg', 'no audio produced')}\n\n{tail[-1500:]}")
+        return
 
     raw_files = res.get("files") or _all_audio(run_dir)
     if not raw_files:
         shutil.rmtree(run_dir, ignore_errors=True)
-        return (*_audio_outputs([]), "❌ No audio produced.")
+        yield (*_audio_outputs([]), "❌ No audio produced.")
+        return
+
+    yield (*keep, "⏳ Finishing…  99%")
 
     # Flat layout: all audio in audio/, with the settings embedded in each file's
     # own metadata (no sidecar). The per-run temp folder is then removed.
@@ -725,7 +780,7 @@ def generate(
         f"✅ Done{seed_note}  ({len(files)} output{'s' if len(files) != 1 else ''})\n"
         f"{timing}{mem}"
     )
-    return (*_audio_outputs(files), status)
+    yield (*_audio_outputs(files), status)
 
 
 # ── load settings ────────────────────────────────────────────────────────────
@@ -879,7 +934,7 @@ def _on_lm_change(lm):
 
 # Dark black/violet + purple-magenta "phonk" theme.
 AG_THEME = gr.themes.Base(
-    primary_hue=gr.themes.colors.purple,
+    primary_hue=gr.themes.colors.emerald,
     secondary_hue=gr.themes.colors.fuchsia,
     neutral_hue=gr.themes.colors.slate,
     font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
@@ -896,12 +951,12 @@ AG_THEME = gr.themes.Base(
     block_background_fill_dark="#16161c",
     block_border_color="#2a2a33",
     block_border_color_dark="#2a2a33",
-    block_label_text_color="#cf9bff",
-    block_title_text_color="#cf9bff",
+    block_label_text_color="#5fe0ad",
+    block_title_text_color="#5fe0ad",
     input_background_fill="#1c1c24",
     input_background_fill_dark="#1c1c24",
-    button_primary_background_fill="linear-gradient(90deg, #a22ff0, #e11d48)",
-    button_primary_background_fill_dark="linear-gradient(90deg, #a22ff0, #e11d48)",
+    button_primary_background_fill="linear-gradient(90deg, #e3197a, #e11d48)",
+    button_primary_background_fill_dark="linear-gradient(90deg, #e3197a, #e11d48)",
     button_primary_text_color="#ffffff",
     button_secondary_background_fill="#24242d",
     button_secondary_background_fill_dark="#24242d",
@@ -910,18 +965,22 @@ AG_THEME = gr.themes.Base(
 
 AG_CSS = """
 .gradio-container {
-  background: radial-gradient(1100px 520px at 50% -8%, #3a0a30 0%, #2a0712 38%, #0a0a0d 100%) !important;
+  background:
+    radial-gradient(900px 480px at 50% -10%, rgba(22,224,160,.20), transparent 62%),
+    radial-gradient(680px 420px at 88% 6%, rgba(20,205,150,.13), transparent 60%),
+    radial-gradient(620px 400px at 8% 104%, rgba(200,30,70,.10), transparent 60%),
+    #0a0a0d !important;
 }
 #ag-title h1 {
   font-weight: 900; font-size: 2.6rem; letter-spacing: .5px;
-  text-shadow: 0 0 24px rgba(200,55,120,.45);
+  text-shadow: 0 0 26px rgba(22,224,160,.35);
 }
 #ag-go {
-  background: linear-gradient(90deg, #a22ff0, #e11d48) !important;
+  background: linear-gradient(90deg, #e3197a, #e11d48) !important;
   color: #fff !important; border: none !important; font-weight: 700 !important;
-  box-shadow: 0 0 22px rgba(200,55,120,.5) !important;
+  box-shadow: 0 0 22px rgba(225,35,95,.55) !important;
 }
-#ag-go:hover { filter: brightness(1.08); box-shadow: 0 0 32px rgba(200,55,120,.75) !important; }
+#ag-go:hover { filter: brightness(1.08); box-shadow: 0 0 32px rgba(225,35,95,.8) !important; }
 #ag-go:disabled, #ag-go[disabled] {
   filter: grayscale(.5) brightness(.65) !important;
   box-shadow: none !important; opacity: .6 !important; cursor: not-allowed !important;
@@ -930,14 +989,14 @@ AG_CSS = """
 #ag-tpl-row { margin-bottom: 22px; }
 #ag-save { align-self: flex-end; }
 /* purple text selection to match the theme */
-::selection { background: #8b2fd6; color: #ffffff; }
-::-moz-selection { background: #8b2fd6; color: #ffffff; }
+::selection { background: #0c6b47; color: #ffffff; }
+::-moz-selection { background: #0c6b47; color: #ffffff; }
 """
 
-with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
+with gr.Blocks(title="AuraGroove", theme=AG_THEME, css=AG_CSS) as demo:
     gr.Markdown(
         '# <span style="color:#ffffff">Aura</span>'
-        '<span style="background:linear-gradient(90deg,#a22ff0,#e11d48);'
+        '<span style="background:linear-gradient(90deg,#3af2ae,#12cf8c);'
         '-webkit-background-clip:text;background-clip:text;color:transparent">Groove</span>',
         elem_id="ag-title",
     )
@@ -1011,7 +1070,7 @@ with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
         with gr.Column(scale=2):
             with gr.Row():
                 go = gr.Button("Generate", variant="primary", elem_id="ag-go")
-                stop_btn = gr.Button("🛑 Stop", variant="stop")
+                stop_btn = gr.Button("Stop", variant="stop")
             out_audios = [
                 gr.Audio(label=f"Result {i + 1}", type="filepath", visible=(i == 0))
                 for i in range(MAX_OUTPUTS)
@@ -1024,7 +1083,7 @@ with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
                     variant="secondary",
                 )
                 open_btn = gr.Button("📁 Open outputs folder", variant="secondary")
-                reset_btn = gr.Button("♻️ Reset worker", variant="secondary")
+                reset_btn = gr.Button("Reset worker", variant="secondary")
             with gr.Row(elem_id="ag-tpl-row"):
                 template_dd = gr.Dropdown(
                     choices=_list_templates(), label="Load template", scale=4,
