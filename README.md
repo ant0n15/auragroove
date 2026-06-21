@@ -10,26 +10,12 @@ It exists to fix two pain points of the stock ACE-Step Gradio app:
 
 Auragroove runs generations through a **persistent worker process** that keeps the
 (INT8-quantized) model **resident in VRAM** — so repeat runs are fast — while a
-**memory watchdog** recycles the worker before the leak can pile up. One-shot
-"Think" runs fall back to a safe subprocess.
-
-## Features
-- 🎛️ Clean Gradio UI with all the useful DiT/LM controls (caption, lyrics, duration,
-  steps, seed, BPM/key/time-sig, guidance, sampler, velocity smoothing, Think/LM, …)
-- ⚡ **Resident model** (INT8) → near-instant repeat generations on 8 GB
-- 🧠 **Resident "Think"** via a small 0.6B LM (optional)
-- 🩹 **Leak-bounded** via a growth-based worker watchdog
-- ⏹️ **Stop** button, **batch** (sequential) outputs, **save/load settings**
-- 🗂️ Flat outputs: `auragroove_outputs/audio/` + `auragroove_outputs/settings/`
-- 🟣 Dark purple→red "aura" theme
-- 📦 **Portable**: self-installs its own Python env + downloads models on first run
+**memory watchdog** recycles the worker before the leak can pile up.
 
 ## Requirements
 - Windows 10/11, 64-bit
-- **NVIDIA GPU** + recent driver (8 GB VRAM is the tuned target; more is fine).
-  CUDA is *not* a separate install — it ships inside PyTorch.
+- **NVIDIA GPU** (8 GB VRAM is the tuned target; more is fine).
 - ~25 GB free disk; internet for the first install
-  (~4–5 GB PyTorch + ~12 GB models)
 
 ## Install & run
 ```text
@@ -51,12 +37,6 @@ worker.py           → persistent generation worker (imports acestep, holds mod
 acestep_engine/     → vendored ACE-Step 1.5 (engine) + patched cli.py
 make_release.ps1    → stage a clean copy (no venv) to move to another PC
 ```
-
-## Tuning (top of `auragroove.py`)
-- `WORKER_OFFLOAD_TO_CPU` — keep `False` to stay resident; set `True` if you OOM.
-- `WORKER_QUANTIZATION` — `int8_weight_only` (default) fits 8 GB; `none` on big GPUs.
-- `WORKER_LM_MODEL` — resident Think LM (`acestep-5Hz-lm-0.6B`); `none` to disable.
-- `RECYCLE_GROWTH_GB` — how much the worker may grow before it's recycled.
 
 ## Credits & licenses
 - **Auragroove** wrapper code: MIT (see `LICENSE`).

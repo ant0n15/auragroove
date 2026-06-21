@@ -1,17 +1,16 @@
 """
 Auragroove — local ACE-Step 1.5 music generator (persistent-worker edition).
 
-Two generation paths:
-  * Pure-DiT (Think OFF): handled by a PERSISTENT worker (worker.py) that loads
-    the model ONCE and serves many requests -> no reload between runs (fast).
-    A watchdog recycles the worker (kill + respawn) when system free RAM drops
-    too low or after N generations, to bound the known memory leak (#142).
-  * Think ON: handled by a one-shot subprocess (cli.py), which exits and frees
-    all RAM afterward (the LM path is heavier and stays on the safe route).
+Generations run through a PERSISTENT worker (worker.py) that loads the model
+ONCE and stays resident -> no reload between runs (fast). Think ON additionally
+keeps the selected 5Hz LM resident. A watchdog recycles the worker (kill +
+respawn) when its RAM grows too far or system free RAM gets low, to bound the
+known memory leak (#142).
 
-Outputs are organized flatly: audio in `auragroove_outputs/audio/`, config in
-`auragroove_outputs/settings/` (matching names). Settings reload via the Load
-button. Timings (load vs generate) are shown and logged.
+Outputs go to `auragroove_outputs/audio/`. Each track's settings are embedded
+directly in its file metadata (ID3 for mp3, tags for wav/flac) -- no sidecar.
+The Load button reads them back from any generated track. Timings are shown
+in the status box after each run.
 
 Run:
     .venv/Scripts/python.exe auragroove.py
@@ -49,13 +48,11 @@ ACESTEP_DIR = APP_DIR / "acestep_engine"
 CKPT_DIR = ACESTEP_DIR / "checkpoints"
 VENV_PY = ACESTEP_DIR / ".venv" / "Scripts" / "python.exe"
 PYTHON = str(VENV_PY) if VENV_PY.exists() else sys.executable
-CLI = str(ACESTEP_DIR / "cli.py")
 WORKER = str(APP_DIR / "worker.py")                             # worker lives here, runs with the bundled venv
 OUT_ROOT = APP_DIR / "auragroove_outputs"                        # outputs land here
 OUT_ROOT.mkdir(exist_ok=True)
 
 AUDIO_EXTS = ("*.mp3", "*.wav", "*.flac")
-STDIN_AUTOCONFIRM = "\n" * 64
 
 # --- Watchdog tuning (persistent worker) -------------------------------------
 # Growth-based recycling: the FIRST generation on a worker only MEASURES its
@@ -92,7 +89,7 @@ WORKER_QUANTIZATION = "int8_weight_only"
 # The 1.7B LM is too big to fit resident with the DiT -- use 0.6B here.
 WORKER_LM_MODEL = "acestep-5Hz-lm-0.6B"
 
-_N_SETTINGS = 34
+_N_SETTINGS = 33
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -180,6 +177,64 @@ def _free_ram_gb():
         return None
 
 
+def _embed_settings(audio_path, cfg):
+    """Embed the (trimmed) settings JSON into the audio file's own metadata."""
+    try:
+        payload = json.dumps(cfg, ensure_ascii=False)
+        ext = Path(audio_path).suffix.lower()
+        if ext == ".mp3":
+            from mutagen.id3 import ID3, TXXX, ID3NoHeaderError
+            try:
+                tags = ID3(audio_path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("TXXX:auragroove")
+            tags.add(TXXX(encoding=3, desc="auragroove", text=payload))
+            tags.save(audio_path)
+        elif ext == ".flac":
+            from mutagen.flac import FLAC
+            f = FLAC(audio_path)
+            f["auragroove"] = payload
+            f.save()
+        elif ext == ".wav":
+            from mutagen.wave import WAVE
+            from mutagen.id3 import TXXX
+            f = WAVE(audio_path)
+            if f.tags is None:
+                f.add_tags()
+            f.tags.delall("TXXX:auragroove")
+            f.tags.add(TXXX(encoding=3, desc="auragroove", text=payload))
+            f.save()
+    except Exception:
+        pass  # never fail a generation over tagging
+
+
+def _read_embedded_settings(path):
+    """Read settings JSON embedded in an audio file; return dict or None."""
+    ext = Path(path).suffix.lower()
+    try:
+        if ext == ".mp3":
+            from mutagen.id3 import ID3
+            for fr in ID3(path).getall("TXXX"):
+                if fr.desc == "auragroove":
+                    return json.loads(str(fr.text[0]))
+        elif ext == ".flac":
+            from mutagen.flac import FLAC
+            f = FLAC(path)
+            if "auragroove" in f:
+                return json.loads(f["auragroove"][0])
+        elif ext == ".wav":
+            from mutagen.wave import WAVE
+            f = WAVE(path)
+            if f.tags is not None:
+                for fr in f.tags.getall("TXXX"):
+                    if fr.desc == "auragroove":
+                        return json.loads(str(fr.text[0]))
+    except Exception:
+        return None
+    return None
+
+
 def _open_outputs_folder():
     OUT_ROOT.mkdir(exist_ok=True)
     try:
@@ -199,6 +254,7 @@ _worker = None
 _worker_model = None
 _worker_offload = None
 _worker_vae = None
+_worker_lm = None
 _worker_gens = 0
 _worker_baseline_rss = None  # worker RSS (GB) measured after its first generation
 _worker_lock = threading.Lock()
@@ -257,7 +313,7 @@ def _read_event(proc):
 
 
 def _kill_worker():
-    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_gens, _worker_baseline_rss
+    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_gens, _worker_baseline_rss
     if _worker is not None:
         try:
             if _worker.poll() is None:
@@ -277,6 +333,7 @@ def _kill_worker():
     _worker_model = None
     _worker_offload = None
     _worker_vae = None
+    _worker_lm = None
     _worker_gens = 0
     _worker_baseline_rss = None
 
@@ -284,22 +341,23 @@ def _kill_worker():
 atexit.register(_kill_worker)
 
 
-def _ensure_worker(model, vae="official", offload=True):
+def _ensure_worker(model, vae="official", lm="none", offload=True):
     """Spawn/respawn the worker if needed. Returns load_time if a (re)spawn
     happened this call, else None (worker was already resident)."""
-    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_gens, _worker_baseline_rss
+    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_gens, _worker_baseline_rss
     need = (
         _worker is None
         or _worker.poll() is not None
         or _worker_model != model
         or _worker_offload != offload
         or _worker_vae != vae
+        or _worker_lm != lm
     )
     if not need:
         return None
     _kill_worker()
     cmd = [PYTHON, WORKER, "--model", model, "--offload", "1" if offload else "0",
-           "--quant", WORKER_QUANTIZATION, "--lm", WORKER_LM_MODEL or "none",
+           "--quant", WORKER_QUANTIZATION, "--lm", lm or "none",
            "--vae", vae or "official"]
     t0 = time.time()
     proc = subprocess.Popen(
@@ -318,16 +376,17 @@ def _ensure_worker(model, vae="official", offload=True):
     _worker_model = model
     _worker_offload = offload
     _worker_vae = vae
+    _worker_lm = lm
     _worker_gens = 0
     _worker_baseline_rss = None
     return ev.get("load_time", time.time() - t0)
 
 
-def _worker_generate(cfg, model, vae="official"):
+def _worker_generate(cfg, model, vae="official", lm="none"):
     global _worker, _worker_gens, _worker_baseline_rss
     with _worker_lock:
         try:
-            load_time = _ensure_worker(model, vae=vae, offload=WORKER_OFFLOAD_TO_CPU)
+            load_time = _ensure_worker(model, vae=vae, lm=lm, offload=WORKER_OFFLOAD_TO_CPU)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
         try:
@@ -389,7 +448,7 @@ def _worker_generate(cfg, model, vae="official"):
         }
 
 
-def _worker_generate_n(cfg, model, vae, n, run_dir):
+def _worker_generate_n(cfg, model, vae, lm, n, run_dir):
     """Run N sequential single-item generations (batch>1 won't fit in VRAM next
     to the resident model on 8GB, so we loop instead). Aggregates the results."""
     files, load_time, gen_time, last = [], None, 0.0, None
@@ -397,7 +456,7 @@ def _worker_generate_n(cfg, model, vae, n, run_dir):
         sub = dict(cfg)
         sub["batch_size"] = 1
         sub["save_dir"] = str(run_dir / f"item_{k}")
-        r = _worker_generate(sub, model, vae=vae)
+        r = _worker_generate(sub, model, vae=vae, lm=lm)
         if not r.get("ok"):
             if files:
                 break  # partial success: keep what we have
@@ -424,62 +483,14 @@ def reset_worker():
     return f"♻️ Worker stopped. Next generation will load the model fresh.{extra}"
 
 
-# ── one-shot path (Think ON) ─────────────────────────────────────────────────
-
-def _oneshot_generate(cfg, cfg_path, run_dir):
-    try:
-        (ACESTEP_DIR / "instruction.txt").unlink()
-    except FileNotFoundError:
-        pass
-
-    cmd = [PYTHON, CLI, "-c", str(cfg_path), "--log-level", "INFO"]
-    t0 = time.time()
-    load_done = gen_start = None
-    out_lines = []
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=str(ACESTEP_DIR),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
-    except Exception as e:
-        return {"ok": False, "msg": f"failed to launch generator: {e}"}
-    try:
-        proc.stdin.write(STDIN_AUTOCONFIRM)
-        proc.stdin.flush()
-        proc.stdin.close()
-    except Exception:
-        pass
-
-    _set_active(proc)
-    for line in proc.stdout:
-        out_lines.append(line)
-        now = time.time()
-        if load_done is None and "Handlers initialized." in line:
-            load_done = now
-        if gen_start is None and "Starting Generation" in line:
-            gen_start = now
-        if now - t0 > 3600:
-            proc.kill()
-            break
-    proc.wait()
-    _set_active(None)
-    t_end = time.time()
-
-    files = _all_audio(run_dir)
-    gen_anchor = gen_start or load_done
-    return {
-        "ok": bool(files),
-        "files": files,
-        "load_time": (load_done - t0) if load_done else None,
-        "gen_time": (t_end - gen_anchor) if gen_anchor else None,
-        "log_tail": "".join(out_lines[-30:]),
-    }
+def _on_generate_start():
+    """Disable the button while a generation runs (progress bar shows status)."""
+    return gr.update(value="Generating…", interactive=False)
 
 
 # ── main generate ────────────────────────────────────────────────────────────
 
-MAX_OUTPUTS = 4
+MAX_OUTPUTS = 10
 
 
 def _audio_outputs(files):
@@ -493,34 +504,24 @@ def _audio_outputs(files):
     return ups
 
 
-def generate(
+def _build_cfg(
     caption, lyrics, instrumental, duration, auto_duration, steps, seed, batch_size,
     audio_format, model, bpm, keyscale, timesignature, vocal_language,
     think, lm_model, lm_temperature, lm_top_k, lm_top_p, lm_cfg_scale,
     lm_negative_prompt, guidance_scale, shift, infer_method, sampler_mode,
     use_adg, cfg_interval_start, cfg_interval_end,
     velocity_norm_threshold, velocity_ema_factor,
-    timesig_auto, cot_metas, cot_language, vae,
-    progress=gr.Progress(),
+    cot_metas, cot_language, vae,
 ):
-    global _stop_requested
-    _stop_requested = False
+    """Build the settings dict from the UI values (no save_dir)."""
     caption = (caption or "").strip()
     lyrics = (lyrics or "").strip()
     if instrumental:
         lyrics = "[Instrumental]"
-    if not caption and (not lyrics or lyrics == "[Instrumental]"):
-        return (*_audio_outputs([]), "❌ Please enter a caption (and/or lyrics).")
-
-    run_dir = OUT_ROOT / f"run_{int(time.time())}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = run_dir / "config.toml"
-
     try:
         seed = int(seed)
     except (TypeError, ValueError):
         seed = -1
-
     cfg = {
         "task_type": "text2music",
         "config_path": model,
@@ -559,7 +560,6 @@ def generate(
         "backend": "pt",
         "audio_format": audio_format,
         "vae": vae,
-        "save_dir": str(run_dir),
     }
     if think:
         cfg["lm_model_path"] = lm_model
@@ -569,26 +569,87 @@ def generate(
         cfg["bpm"] = int(bpm)
     if (keyscale or "").strip():
         cfg["keyscale"] = keyscale.strip()
-    if not timesig_auto and (timesignature or "").strip():
+    if (timesignature or "").strip():
         cfg["timesignature"] = timesignature.strip()
     if vocal_language and not instrumental:
         cfg["vocal_language"] = vocal_language.strip()
+    return cfg
+
+
+def save_template(name, *values):
+    """Save the current UI values as a named template; refresh the dropdown."""
+    name = (name or "").strip()
+    if not name:
+        return gr.update(), "❌ Enter a template name first. Use an existing name to overwrite."
+    safe = "".join(c for c in name if c.isalnum() or c in " -_").strip()
+    if not safe:
+        return gr.update(), "❌ Invalid template name."
+    cfg = _build_cfg(*values)
+    cfg.pop("save_dir", None)
+    existed = (TEMPLATES_DIR / f"{safe}.toml").exists()
+    try:
+        _write_config(cfg, TEMPLATES_DIR / f"{safe}.toml")
+    except Exception as e:
+        return gr.update(), f"❌ Could not save: {e}"
+    msg = (f"💾 Updated existing template '{safe}'." if existed
+           else f"💾 Saved new template '{safe}'.")
+    # Refresh choices only (don't change the selected value) so this doesn't
+    # trigger the dropdown's change handler (which would clear the name field).
+    return gr.update(choices=_list_templates()), msg
+
+
+def generate(
+    caption, lyrics, instrumental, duration, auto_duration, steps, seed, batch_size,
+    audio_format, model, bpm, keyscale, timesignature, vocal_language,
+    think, lm_model, lm_temperature, lm_top_k, lm_top_p, lm_cfg_scale,
+    lm_negative_prompt, guidance_scale, shift, infer_method, sampler_mode,
+    use_adg, cfg_interval_start, cfg_interval_end,
+    velocity_norm_threshold, velocity_ema_factor,
+    cot_metas, cot_language, vae,
+    progress=gr.Progress(),
+):
+    global _stop_requested
+    _stop_requested = False
+    caption = (caption or "").strip()
+    lyrics = (lyrics or "").strip()
+    if instrumental:
+        lyrics = "[Instrumental]"
+    if not caption and (not lyrics or lyrics == "[Instrumental]"):
+        return (*_audio_outputs([]), "❌ Please enter a caption (and/or lyrics).")
+
+    run_dir = OUT_ROOT / f"run_{int(time.time())}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = run_dir / "config.toml"
+
+    cfg = _build_cfg(
+        caption, lyrics, instrumental, duration, auto_duration, steps, seed, batch_size,
+        audio_format, model, bpm, keyscale, timesignature, vocal_language,
+        think, lm_model, lm_temperature, lm_top_k, lm_top_p, lm_cfg_scale,
+        lm_negative_prompt, guidance_scale, shift, infer_method, sampler_mode,
+        use_adg, cfg_interval_start, cfg_interval_end,
+        velocity_norm_threshold, velocity_ema_factor,
+        cot_metas, cot_language, vae,
+    )
+    cfg["save_dir"] = str(run_dir)
 
     _write_config(cfg, cfg_path)
 
-    resident_think = WORKER_LM_MODEL not in (None, "none", "")
-    if think and not resident_think:
-        progress(0.05, desc="Think ON: one-shot run (loads LM + model, frees after)...")
-        res = _oneshot_generate(cfg, cfg_path, run_dir)
+    # Think uses the selected LM (resident); Think off loads no LM (more VRAM).
+    lm_sel = lm_model if think else "none"
+    n_out = max(1, min(int(batch_size), MAX_OUTPUTS))
+    fresh_load = (_worker is None or _worker.poll() is not None
+                  or _worker_model != model or _worker_vae != vae or _worker_lm != lm_sel)
+    if fresh_load:
+        desc = "Model was not loaded on GPU, this may take longer…"
+    elif n_out > 1:
+        desc = f"Generating {n_out} outputs…"
     else:
-        n_out = max(1, min(int(batch_size), MAX_OUTPUTS))
-        desc = (f"Persistent worker (resident model"
-                + (" + LM" if resident_think else "")
-                + (f"), generating {n_out} sequentially..." if n_out > 1 else ")..."))
-        progress(0.05, desc=desc)
-        res = _worker_generate_n(cfg, model, vae, n_out, run_dir)
+        desc = "Generating…"
+    progress(0.05, desc=desc)
+    res = _worker_generate_n(cfg, model, vae, lm_sel, n_out, run_dir)
 
     if not res.get("ok"):
+        shutil.rmtree(run_dir, ignore_errors=True)
         if _stop_requested:
             return (*_audio_outputs([]), "🛑 Generation stopped. (Worker was terminated; next run reloads the model.)")
         tail = res.get("trace") or res.get("log_tail") or ""
@@ -596,14 +657,13 @@ def generate(
 
     raw_files = res.get("files") or _all_audio(run_dir)
     if not raw_files:
+        shutil.rmtree(run_dir, ignore_errors=True)
         return (*_audio_outputs([]), "❌ No audio produced.")
 
-    # Reorganize into a flat layout: all audio in audio/, all config in settings/,
-    # with matching timestamped names. The per-run temp folder is then removed.
+    # Flat layout: all audio in audio/, with the settings embedded in each file's
+    # own metadata (no sidecar). The per-run temp folder is then removed.
     audio_dir = OUT_ROOT / "audio"
-    settings_dir = OUT_ROOT / "settings"
     audio_dir.mkdir(exist_ok=True)
-    settings_dir.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
     files = []
@@ -625,17 +685,8 @@ def generate(
             shutil.move(str(src), str(dest_audio))
         except Exception:
             dest_audio = src
+        _embed_settings(str(dest_audio), cfg)  # settings live inside the file
         files.append(str(dest_audio))
-        # settings: our request config (.toml, loadable) + pipeline metadata (.json)
-        try:
-            shutil.copyfile(cfg_path, str(settings_dir / f"{base}.toml"))
-        except Exception:
-            pass
-        if meta.exists():
-            try:
-                shutil.move(str(meta), str(settings_dir / f"{base}.json"))
-            except Exception:
-                pass
 
     # Drop the temp run folder (leftover item subdirs, intermediates, config.toml).
     shutil.rmtree(run_dir, ignore_errors=True)
@@ -670,16 +721,6 @@ def generate(
         if res.get("recycled"):
             mem += f"  →  recycled ({res.get('reason')}; next run reloads)"
 
-    try:
-        with open(OUT_ROOT / "timings.log", "a", encoding="utf-8") as lf:
-            lf.write(
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{timing}\t"
-                f"path={'think/oneshot' if think else 'worker'}\t"
-                f"steps={int(steps)} dur={cfg['duration']}\t{caption[:60]}\n"
-            )
-    except Exception:
-        pass
-
     status = (
         f"✅ Done{seed_note}  ({len(files)} output{'s' if len(files) != 1 else ''})\n"
         f"{timing}{mem}"
@@ -694,16 +735,8 @@ LM_MODELS = _available_lm_models()
 VAES = _available_vaes()
 
 
-def load_settings(file):
-    if file is None:
-        return [gr.update()] * _N_SETTINGS
-    path = file.name if hasattr(file, "name") else file
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = toml.load(f)
-    except Exception:
-        return [gr.update()] * _N_SETTINGS
-
+def _cfg_to_updates(cfg):
+    """Map a settings dict to the ordered list of SETTING_INPUTS values."""
     def g(k, d=None):
         v = cfg.get(k, d)
         return d if v is None else v
@@ -753,11 +786,93 @@ def load_settings(file):
         float(g("cfg_interval_end", 1.0)),
         float(g("velocity_norm_threshold", 0.0)),
         float(g("velocity_ema_factor", 0.0)),
-        (not bool(cfg.get("timesignature"))),    # timesig_auto
         bool(g("use_cot_metas", True)),          # cot_metas
         bool(g("use_cot_language", False)),       # cot_language
         (g("vae", "official") if g("vae", "official") in VAES else "official"),  # vae
     ]
+
+
+def load_settings(file):
+    """Load settings from a generated track (mp3/wav/flac) or an old .toml."""
+    if file is None:
+        return [gr.update()] * _N_SETTINGS
+    path = file.name if hasattr(file, "name") else file
+    ext = Path(path).suffix.lower()
+    try:
+        if ext in (".mp3", ".wav", ".flac"):
+            cfg = _read_embedded_settings(path)
+        elif ext == ".toml":
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = toml.load(f)
+        else:
+            cfg = None
+    except Exception:
+        cfg = None
+    if not cfg:
+        return [gr.update()] * _N_SETTINGS
+    return _cfg_to_updates(cfg)
+
+
+def load_audio(file):
+    """Apply a track's embedded settings AND load it into the player to play."""
+    settings = load_settings(file)
+    players = [gr.update()] * MAX_OUTPUTS
+    if file is not None:
+        path = file.name if hasattr(file, "name") else file
+        if path and Path(path).suffix.lower() in (".mp3", ".wav", ".flac"):
+            players = _audio_outputs([path])
+    return [*settings, *players]
+
+
+# ── templates (named presets: caption, lyrics, and all params) ────────────────
+
+TEMPLATES_DIR = APP_DIR / "templates"
+TEMPLATES_DIR.mkdir(exist_ok=True)
+
+
+def _list_templates():
+    return sorted(p.stem for p in TEMPLATES_DIR.glob("*.toml"))
+
+
+def load_template(name):
+    """Apply a saved template's settings to the UI."""
+    if not name:
+        return [gr.update()] * _N_SETTINGS
+    path = TEMPLATES_DIR / f"{name}.toml"
+    if not path.exists():
+        return [gr.update()] * _N_SETTINGS
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = toml.load(f)
+    except Exception:
+        return [gr.update()] * _N_SETTINGS
+    return _cfg_to_updates(cfg)
+
+
+# Template applied to the form on startup (keeps defaults in sync with the file).
+DEFAULT_TEMPLATE = "Brazilian phonk"
+
+
+def _load_default_template():
+    if DEFAULT_TEMPLATE in _list_templates():
+        return load_template(DEFAULT_TEMPLATE)
+    return [gr.update()] * _N_SETTINGS
+
+
+def _on_infer_method_change(infer_method, sampler_mode):
+    """SDE can't use Heun (engine falls back to Euler), so restrict the choices."""
+    if infer_method == "sde":
+        return gr.update(choices=["euler"], value="euler")
+    keep = sampler_mode if sampler_mode in ("euler", "heun") else "heun"
+    return gr.update(choices=["euler", "heun"], value=keep)
+
+
+def _on_lm_change(lm):
+    """Warn when a bigger LM is selected (it needs much more VRAM); clear otherwise."""
+    if lm and ("1.7b" in lm.lower() or "4b" in lm.lower()):
+        return ("⚠️ Bigger LM selected — keep it only if your GPU has more than 12GB VRAM "
+                "(on 8 GB use the 0.6B, or it will run out of memory).")
+    return ""
 
 
 # ── UI ───────────────────────────────────────────────────────────────────────
@@ -811,6 +926,12 @@ AG_CSS = """
   filter: grayscale(.5) brightness(.65) !important;
   box-shadow: none !important; opacity: .6 !important; cursor: not-allowed !important;
 }
+/* template row: bigger gap below it, and align the 💾 with the input fields */
+#ag-tpl-row { margin-bottom: 22px; }
+#ag-save { align-self: flex-end; }
+/* purple text selection to match the theme */
+::selection { background: #8b2fd6; color: #ffffff; }
+::-moz-selection { background: #8b2fd6; color: #ffffff; }
 """
 
 with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
@@ -821,57 +942,52 @@ with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
         elem_id="ag-title",
     )
     with gr.Row():
-        load_btn = gr.UploadButton(
-            "📂 Load settings (.toml)", file_types=[".toml"], file_count="single",
-            variant="secondary",
-        )
-        open_btn = gr.Button("📁 Open outputs folder", variant="secondary")
-        reset_btn = gr.Button("♻️ Reset worker (free RAM)", variant="secondary")
-    with gr.Row():
         with gr.Column(scale=3):
             caption = gr.Textbox(
                 label="Music Caption",
-                value="brazilian phonk, brazilian baile funk, aggressive, dark, vocal chops, female vocals",
+                value="Aggressive brazilian phonk driven by brazilian baile funk, hollering, and chopped vocals. The overall production is bass boosted and punchy, designed for maximum impact.",
                 placeholder="Brazilian phonk, aggressive bass-boosted funk, heavy distorted 808, cowbell melody, 130 BPM",
                 lines=3,
             )
             instrumental = gr.Checkbox(label="Instrumental (no vocals)", value=False)
             lyrics = gr.Textbox(
                 label="Lyrics (optional; ignored if Instrumental is checked)",
-                value="boom, boom,\nboom, boom",
+                value="yy, kaa, koo,\ntung, tung, tung.",
                 placeholder="[verse]\n...",
                 lines=4,
             )
             with gr.Row():
-                duration = gr.Slider(10, 240, value=75, step=5, label="Duration (s)")
+                duration = gr.Slider(10, 240, value=60, step=5, label="Duration (s)")
                 steps = gr.Slider(4, 60, value=8, step=1, label="Steps (8 = turbo)")
             auto_duration = gr.Checkbox(label="Auto duration (-1): let the model decide (ignores the slider)", value=False)
             with gr.Row():
                 seed = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
-                batch_size = gr.Slider(1, 4, value=1, step=1, label="# Outputs")
+                batch_size = gr.Slider(1, 10, value=1, step=1, label="# Outputs")
             with gr.Row():
                 bpm = gr.Number(value=140, label="BPM (0 = auto)", precision=0)
                 keyscale = gr.Textbox(value="B Major", label="Key (e.g. C Major; empty = auto)")
-                timesignature = gr.Textbox(value="4/4", label="Time sig (e.g. 4/4)")
-            timesig_auto = gr.Checkbox(value=False, label="TimeSig Auto (let model choose; ignores the Time sig field)")
+                timesignature = gr.Textbox(value="4/4", label="Time sig (e.g. 4/4; empty = auto)")
             with gr.Row():
                 model = gr.Dropdown(choices=MODELS, value=MODELS[0], label="DiT Model")
                 vae = gr.Dropdown(choices=VAES, value=("scragvae" if "scragvae" in VAES else VAES[0]), label="VAE (changing reloads worker)")
                 audio_format = gr.Dropdown(choices=["mp3", "wav", "flac"], value="mp3", label="Format")
-                vocal_language = gr.Textbox(value="en", label="Vocal lang")
+                vocal_language = gr.Textbox(value="fi", label="Vocal lang")
 
-            with gr.Accordion("🧠 Think (LM) — one-shot path; slower + more RAM each run", open=False):
+            with gr.Accordion("🧠 Think (LM)", open=False):
                 think = gr.Checkbox(
                     label="Enable Think (loads the 5Hz LM to reason about structure/metadata)",
                     value=True,
                 )
-                lm_model = gr.Dropdown(choices=LM_MODELS, value=LM_MODELS[0], label="LM model")
+                lm_model = gr.Dropdown(
+                    choices=LM_MODELS, label="LM model (Think)",
+                    value=(WORKER_LM_MODEL if WORKER_LM_MODEL in LM_MODELS else LM_MODELS[0]),
+                )
                 with gr.Row():
                     lm_temperature = gr.Slider(0.0, 2.0, value=0.85, step=0.05, label="LM temperature (0.85 = recommended)")
                     lm_cfg_scale = gr.Slider(1.0, 10.0, value=2.8, step=0.1, label="LM CFG scale")
                 with gr.Row():
                     lm_top_k = gr.Number(value=0, label="LM top-k (0 = off)", precision=0)
-                    lm_top_p = gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="LM top-p")
+                    lm_top_p = gr.Slider(0.0, 1.0, value=0.95, step=0.01, label="LM top-p")
                 lm_negative_prompt = gr.Textbox(value="low quality, noise", label="LM negative prompt (optional)")
                 with gr.Row():
                     cot_metas = gr.Checkbox(value=True, label="CoT Metas (LM reasons out BPM/key/structure first)")
@@ -901,6 +1017,21 @@ with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
                 for i in range(MAX_OUTPUTS)
             ]
             status = gr.Textbox(label="Status", lines=12, interactive=False)
+            with gr.Row():
+                load_btn = gr.UploadButton(
+                    "📂 Load audio",
+                    file_types=[".mp3", ".wav", ".flac", ".toml"], file_count="single",
+                    variant="secondary",
+                )
+                open_btn = gr.Button("📁 Open outputs folder", variant="secondary")
+                reset_btn = gr.Button("♻️ Reset worker", variant="secondary")
+            with gr.Row(elem_id="ag-tpl-row"):
+                template_dd = gr.Dropdown(
+                    choices=_list_templates(), label="Load template", scale=4,
+                    value=("Brazilian phonk" if "Brazilian phonk" in _list_templates() else None),
+                )
+                tpl_name = gr.Textbox(label="Save as template", placeholder="e.g. brazilian phonk", scale=4)
+                save_tpl_btn = gr.Button("💾", variant="secondary", scale=0, min_width=46, elem_id="ag-save")
 
     SETTING_INPUTS = [
         caption, lyrics, instrumental, duration, auto_duration, steps, seed, batch_size,
@@ -909,11 +1040,10 @@ with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
         lm_negative_prompt, guidance_scale, shift, infer_method, sampler_mode,
         use_adg, cfg_interval_start, cfg_interval_end,
         velocity_norm_threshold, velocity_ema_factor,
-        timesig_auto, cot_metas, cot_language, vae,
+        cot_metas, cot_language, vae,
     ]
 
-    _busy = go.click(lambda: gr.update(value="Generating…", interactive=False),
-                     inputs=None, outputs=go, queue=False)
+    _busy = go.click(_on_generate_start, inputs=None, outputs=go, queue=False)
     gen_event = _busy.then(generate, inputs=SETTING_INPUTS, outputs=[*out_audios, status])
     gen_event.then(lambda: gr.update(value="Generate", interactive=True),
                    inputs=None, outputs=go, queue=False)
@@ -921,10 +1051,20 @@ with gr.Blocks(title="Auragroove", theme=AG_THEME, css=AG_CSS) as demo:
         stop_generation, inputs=None, outputs=status, queue=False, cancels=[gen_event]
     ).then(lambda: gr.update(value="Generate", interactive=True),
            inputs=None, outputs=go, queue=False)
-    load_btn.upload(load_settings, inputs=load_btn, outputs=SETTING_INPUTS)
+    load_btn.upload(load_audio, inputs=load_btn, outputs=[*SETTING_INPUTS, *out_audios])
     open_btn.click(_open_outputs_folder, inputs=None, outputs=None)
     reset_btn.click(reset_worker, inputs=None, outputs=status)
+    template_dd.change(load_template, inputs=template_dd, outputs=SETTING_INPUTS).then(
+        lambda: gr.update(value=""), inputs=None, outputs=tpl_name)
+    save_tpl_btn.click(save_template, inputs=[tpl_name, *SETTING_INPUTS],
+                       outputs=[template_dd, status])
+    infer_method.change(_on_infer_method_change,
+                        inputs=[infer_method, sampler_mode], outputs=sampler_mode)
+    lm_model.change(_on_lm_change, inputs=lm_model, outputs=status)
+    demo.load(_load_default_template, inputs=None, outputs=SETTING_INPUTS)
 
 if __name__ == "__main__":
     demo.queue()  # required for the Stop button's cancel + concurrent events
-    demo.launch(server_name="127.0.0.1", server_port=7861, inbrowser=True)
+    _favicon = APP_DIR / "favicon.ico"
+    demo.launch(server_name="127.0.0.1", server_port=7861, inbrowser=True,
+                favicon_path=str(_favicon) if _favicon.exists() else None)
