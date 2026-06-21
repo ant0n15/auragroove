@@ -1,0 +1,27 @@
+# --- Python environment (rebuilt by install.bat from the lockfile) ---
+acestep_engine/.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Model weights (downloaded by install.bat / fetch_models.py; too big for git) ---
+acestep_engine/checkpoints/
+
+# --- Generated output (audio + per-track settings) ---
+auragroove_outputs/
+# older / stray output folders (your test renders)
+hits/
+output/
+simple_ui_outputs/
+
+# --- Bundled installer binary (install.bat downloads uv if absent) ---
+tools/uv.exe
+
+# --- misc ---
+.cache/
+.claude/
+*.log
+.DS_Store
+Thumbs.db
+instruction.txt
+auragroove_release/
