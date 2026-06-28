@@ -21,7 +21,7 @@ tools/uv.exe
 finetune/dataset/
 finetune/cache/
 finetune/loras/
-finetune/dataset.json
+finetune/*.json
 
 # --- misc ---
 .cache/
