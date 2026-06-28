@@ -128,6 +128,33 @@ def _available_vaes():
     return ["official"] + extra
 
 
+LORAS_DIR = APP_DIR / "finetune" / "loras"
+
+
+def _available_loras():
+    """'none' plus any trained adapters under finetune/loras/."""
+    found = []
+    if LORAS_DIR.exists():
+        for p in sorted(LORAS_DIR.iterdir()):
+            if p.is_dir() and any(p.rglob("*.safetensors")):
+                found.append(p.name)
+            elif p.suffix.lower() in (".safetensors", ".pt", ".ckpt"):
+                found.append(p.name)
+    return ["none"] + found
+
+
+def _lora_path(name):
+    """Resolve a LoRA dropdown choice to the adapter path, or 'none'.
+    Trained adapters live in <name>/final/; fall back to <name>/ for flat dirs."""
+    if not name or name == "none":
+        return "none"
+    base = LORAS_DIR / name
+    final = base / "final"
+    if final.exists() and any(final.glob("*.safetensors")):
+        return str(final)
+    return str(base)
+
+
 def _write_config(cfg: dict, path: Path):
     if toml is not None:
         with open(path, "w", encoding="utf-8") as f:
@@ -255,6 +282,7 @@ _worker_model = None
 _worker_offload = None
 _worker_vae = None
 _worker_lm = None
+_worker_lora = None
 _worker_gens = 0
 _worker_baseline_rss = None  # worker RSS (GB) measured after its first generation
 _worker_lock = threading.Lock()
@@ -322,7 +350,7 @@ def _read_event(proc, on_progress=None):
 
 
 def _kill_worker():
-    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_gens, _worker_baseline_rss
+    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_lora, _worker_gens, _worker_baseline_rss
     if _worker is not None:
         try:
             if _worker.poll() is None:
@@ -343,6 +371,7 @@ def _kill_worker():
     _worker_offload = None
     _worker_vae = None
     _worker_lm = None
+    _worker_lora = None
     _worker_gens = 0
     _worker_baseline_rss = None
 
@@ -350,24 +379,31 @@ def _kill_worker():
 atexit.register(_kill_worker)
 
 
-def _ensure_worker(model, vae="official", lm="none", offload=True):
+def _ensure_worker(model, vae="official", lm="none", lora="none", offload=True):
     """Spawn/respawn the worker if needed. Returns load_time if a (re)spawn
     happened this call, else None (worker was already resident)."""
-    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_gens, _worker_baseline_rss
+    global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_lora, _worker_gens, _worker_baseline_rss
+    # Per-model precision: the distilled TURBO survives INT8 (fast, resident). The
+    # non-distilled BASE/SFT models get corrupted by INT8 (errors compound over 50
+    # steps + CFG), so run them in full precision with CPU-offload to still fit 8GB.
+    is_turbo = "turbo" in (model or "").lower()
+    quant = WORKER_QUANTIZATION if is_turbo else "none"
+    offload_eff = WORKER_OFFLOAD_TO_CPU if is_turbo else True
     need = (
         _worker is None
         or _worker.poll() is not None
         or _worker_model != model
-        or _worker_offload != offload
+        or _worker_offload != offload_eff
         or _worker_vae != vae
         or _worker_lm != lm
+        or _worker_lora != lora
     )
     if not need:
         return None
     _kill_worker()
-    cmd = [PYTHON, WORKER, "--model", model, "--offload", "1" if offload else "0",
-           "--quant", WORKER_QUANTIZATION, "--lm", lm or "none",
-           "--vae", vae or "official"]
+    cmd = [PYTHON, WORKER, "--model", model, "--offload", "1" if offload_eff else "0",
+           "--quant", quant, "--lm", lm or "none",
+           "--vae", vae or "official", "--lora", lora or "none"]
     t0 = time.time()
     proc = subprocess.Popen(
         cmd, cwd=str(ACESTEP_DIR),
@@ -383,19 +419,20 @@ def _ensure_worker(model, vae="official", lm="none", offload=True):
         raise RuntimeError(f"worker failed to load: {ev.get('msg')}")
     _worker = proc
     _worker_model = model
-    _worker_offload = offload
+    _worker_offload = offload_eff
     _worker_vae = vae
     _worker_lm = lm
+    _worker_lora = lora
     _worker_gens = 0
     _worker_baseline_rss = None
     return ev.get("load_time", time.time() - t0)
 
 
-def _worker_generate(cfg, model, vae="official", lm="none", on_progress=None):
+def _worker_generate(cfg, model, vae="official", lm="none", lora="none", on_progress=None):
     global _worker, _worker_gens, _worker_baseline_rss
     with _worker_lock:
         try:
-            load_time = _ensure_worker(model, vae=vae, lm=lm, offload=WORKER_OFFLOAD_TO_CPU)
+            load_time = _ensure_worker(model, vae=vae, lm=lm, lora=lora, offload=WORKER_OFFLOAD_TO_CPU)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
         try:
@@ -457,7 +494,7 @@ def _worker_generate(cfg, model, vae="official", lm="none", on_progress=None):
         }
 
 
-def _worker_generate_n(cfg, model, vae, lm, n, run_dir, on_item_progress=None):
+def _worker_generate_n(cfg, model, vae, lm, lora, n, run_dir, on_item_progress=None):
     """Run N sequential single-item generations (batch>1 won't fit in VRAM next
     to the resident model on 8GB, so we loop instead). Aggregates the results."""
     files, load_time, gen_time, last = [], None, 0.0, None
@@ -466,7 +503,7 @@ def _worker_generate_n(cfg, model, vae, lm, n, run_dir, on_item_progress=None):
         sub["batch_size"] = 1
         sub["save_dir"] = str(run_dir / f"item_{k}")
         cb = (lambda r, d, _k=k: on_item_progress(_k, r, d)) if on_item_progress else None
-        r = _worker_generate(sub, model, vae=vae, lm=lm, on_progress=cb)
+        r = _worker_generate(sub, model, vae=vae, lm=lm, lora=lora, on_progress=cb)
         if not r.get("ok"):
             if files:
                 break  # partial success: keep what we have
@@ -616,6 +653,7 @@ def generate(
     use_adg, cfg_interval_start, cfg_interval_end,
     velocity_norm_threshold, velocity_ema_factor,
     cot_metas, cot_language, vae,
+    ref_audio=None, cover_strength=0.7, lora_name="none", lora_strength=0.8,
 ):
     global _stop_requested
     _stop_requested = False
@@ -624,8 +662,8 @@ def generate(
     lyrics = (lyrics or "").strip()
     if instrumental:
         lyrics = "[Instrumental]"
-    if not caption and (not lyrics or lyrics == "[Instrumental]"):
-        yield (*_audio_outputs([]), "❌ Please enter a caption (and/or lyrics).")
+    if not caption and (not lyrics or lyrics == "[Instrumental]") and not ref_audio:
+        yield (*_audio_outputs([]), "❌ Please enter a caption (and/or lyrics), or drop a reference audio.")
         return
 
     run_dir = OUT_ROOT / f"run_{int(time.time())}"
@@ -644,11 +682,24 @@ def generate(
     cfg["save_dir"] = str(run_dir)
     _write_config(cfg, cfg_path)
 
+    # Reference audio -> "cover" (Remix): the engine loads the source, locks the
+    # output duration to it, and skips the LM (so Think doesn't apply here).
+    if ref_audio:
+        cfg["task_type"] = "cover"
+        cfg["src_audio"] = ref_audio
+        cfg["audio_cover_strength"] = float(cover_strength)
+        cfg["cover_noise_strength"] = 0.0
+
     # Think uses the selected LM (resident); Think off loads no LM (more VRAM).
-    lm_sel = lm_model if think else "none"
+    # Cover skips the LM entirely, so don't keep one resident for it.
+    lm_sel = (lm_model if (think and not ref_audio) else "none")
+    lora_sel = _lora_path(lora_name)
+    if lora_sel != "none":
+        cfg["lora_scale"] = float(lora_strength)
     n_out = max(1, min(int(batch_size), MAX_OUTPUTS))
     fresh_load = (_worker is None or _worker.poll() is not None
-                  or _worker_model != model or _worker_vae != vae or _worker_lm != lm_sel)
+                  or _worker_model != model or _worker_vae != vae
+                  or _worker_lm != lm_sel or _worker_lora != lora_sel)
     base = ("Loading model to GPU, this may take some time…" if fresh_load
             else (f"Generating {n_out} outputs…" if n_out > 1 else "Generating…"))
 
@@ -678,7 +729,7 @@ def generate(
 
     th = threading.Thread(
         target=lambda: state.update(
-            res=_worker_generate_n(cfg, model, vae, lm_sel, n_out, run_dir,
+            res=_worker_generate_n(cfg, model, vae, lm_sel, lora_sel, n_out, run_dir,
                                    on_item_progress=_on_item_progress)),
         daemon=True,
     )
@@ -1032,6 +1083,26 @@ with gr.Blocks(title="AuraGroove", theme=AG_THEME, css=AG_CSS) as demo:
                 audio_format = gr.Dropdown(choices=["mp3", "wav", "flac"], value="mp3", label="Format")
                 vocal_language = gr.Textbox(value="fi", label="Vocal lang")
 
+            with gr.Accordion("🎚 Remix from reference audio (optional)", open=False):
+                ref_audio = gr.Audio(
+                    sources=["upload"], type="filepath",
+                    label="Drop a track to remix/cover it (Think + duration are ignored — output follows the source)",
+                )
+                cover_strength = gr.Slider(
+                    0.0, 1.0, value=0.7, step=0.05,
+                    label="Reference strength (1 = close to the source, lower = more creative)",
+                )
+
+            with gr.Accordion("🎛 LoRA (your fine-tuned style)", open=False):
+                lora_dd = gr.Dropdown(
+                    choices=_available_loras(), value="none",
+                    label="LoRA adapter (train one with train_lora.bat; changing reloads worker)",
+                )
+                lora_strength = gr.Slider(
+                    0.0, 1.0, value=0.8, step=0.05,
+                    label="LoRA strength (0 = off, 1 = full)",
+                )
+
             with gr.Accordion("🧠 Think (LM)", open=False):
                 think = gr.Checkbox(
                     label="Enable Think (loads the 5Hz LM to reason about structure/metadata)",
@@ -1103,7 +1174,11 @@ with gr.Blocks(title="AuraGroove", theme=AG_THEME, css=AG_CSS) as demo:
     ]
 
     _busy = go.click(_on_generate_start, inputs=None, outputs=go, queue=False)
-    gen_event = _busy.then(generate, inputs=SETTING_INPUTS, outputs=[*out_audios, status])
+    gen_event = _busy.then(
+        generate,
+        inputs=[*SETTING_INPUTS, ref_audio, cover_strength, lora_dd, lora_strength],
+        outputs=[*out_audios, status],
+    )
     gen_event.then(lambda: gr.update(value="Generate", interactive=True),
                    inputs=None, outputs=go, queue=False)
     stop_btn.click(
@@ -1120,6 +1195,10 @@ with gr.Blocks(title="AuraGroove", theme=AG_THEME, css=AG_CSS) as demo:
     infer_method.change(_on_infer_method_change,
                         inputs=[infer_method, sampler_mode], outputs=sampler_mode)
     lm_model.change(_on_lm_change, inputs=lm_model, outputs=status)
+    lora_dd.change(
+        lambda n: ("🎛 LoRA: none (off)" if (not n or n == "none")
+                   else f"🎛 LoRA: {n} — applies on next Generate"),
+        inputs=lora_dd, outputs=status)
     demo.load(_load_default_template, inputs=None, outputs=SETTING_INPUTS)
 
 if __name__ == "__main__":

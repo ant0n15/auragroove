@@ -30,6 +30,13 @@ import argparse
 # Route any library prints to stderr so stdout is a clean protocol channel.
 _real_stdout = sys.stdout
 sys.stdout = sys.stderr
+# Force UTF-8 on the streams so emoji/Unicode in engine logs (e.g. the "✅ LoRA
+# loaded" message) don't crash on legacy console code pages (e.g. cp1253).
+for _s in (_real_stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Self-contained engine bundled in this project (acestep package + checkpoints).
 # Put it on the import path so `import acestep` resolves locally. No Pinokio.
@@ -67,11 +74,14 @@ def main():
                     help="resident LM model name for Think, or 'none' to disable")
     ap.add_argument("--vae", default="official",
                     help="VAE variant: official | scragvae | <path>")
+    ap.add_argument("--lora", default="none",
+                    help="path to a trained LoRA adapter dir/file, or 'none'")
     args = ap.parse_args()
     offload = str(args.offload).lower() in ("1", "true", "yes")
     quantization = None if str(args.quant).lower() in ("none", "", "0") else args.quant
     lm_model = None if str(args.lm).lower() in ("none", "", "0") else args.lm
     vae_checkpoint = None if str(args.vae).lower() in ("official", "none", "") else args.vae
+    lora_path = None if str(args.lora).lower() in ("none", "", "0") else args.lora
 
     t0 = time.time()
     try:
@@ -96,6 +106,10 @@ def main():
             quantization=quantization,
             vae_checkpoint=vae_checkpoint,
         )
+        if lora_path:
+            msg = dit.load_lora(lora_path)
+            print(f"[worker] load_lora: {msg}", file=sys.stderr)
+
         llm = LLMHandler()
         if lm_model:
             llm.initialize(checkpoint_dir=os.path.join(ACESTEP_DIR, "checkpoints"),
@@ -106,7 +120,8 @@ def main():
         return
 
     emit({"event": "ready", "load_time": time.time() - t0,
-          "lm": bool(getattr(llm, "llm_initialized", False))})
+          "lm": bool(getattr(llm, "llm_initialized", False)),
+          "lora": bool(lora_path)})
 
     for line in sys.stdin:
         line = line.strip()
@@ -131,6 +146,9 @@ def main():
             seed = int(req.get("seed", -1))
             params = GenerationParams(
                 task_type=req.get("task_type", "text2music"),
+                src_audio=req.get("src_audio") or None,
+                audio_cover_strength=float(req.get("audio_cover_strength", 1.0)),
+                cover_noise_strength=float(req.get("cover_noise_strength", 0.0)),
                 caption=req.get("caption", ""),
                 lyrics=lyrics,
                 instrumental=instrumental,
@@ -169,6 +187,12 @@ def main():
                 audio_format=req.get("audio_format", "mp3"),
             )
             save_dir = req.get("save_dir")
+
+            if lora_path:
+                try:
+                    dit.set_lora_scale(float(req.get("lora_scale", 1.0)))
+                except Exception:
+                    pass
 
             gt0 = time.time()
             generate_music(dit, llm, params, config, save_dir=save_dir, progress=_progress)

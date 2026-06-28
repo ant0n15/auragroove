@@ -17,6 +17,12 @@ simple_ui_outputs/
 # --- Bundled installer binary (install.bat downloads uv if absent) ---
 tools/uv.exe
 
+# --- Fine-tuning data (your audio, preprocessed tensors, trained adapters) ---
+finetune/dataset/
+finetune/cache/
+finetune/loras/
+finetune/dataset.json
+
 # --- misc ---
 .cache/
 .claude/
