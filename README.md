@@ -12,6 +12,14 @@ Auragroove runs generations through a **persistent worker process** that keeps t
 (INT8-quantized) model **resident in VRAM** — so repeat runs are fast — while a
 **memory watchdog** recycles the worker before the leak can pile up.
 
+## Features
+- **Text → music** with full control (caption, lyrics, BPM, key, steps, seed, …).
+- **Genre templates** — one-click presets (Brazilian phonk, lo-fi, trap, techno, …); save your own.
+- **Remix from reference audio** — drop a track to generate a cover/remix of it.
+- **Think (LM)** — optional 5Hz LM to reason about structure/metadata.
+- **Fine-tune your own style** — train a LoRA on your tracks (see below).
+- **Up to 10 outputs** per run, real progress in the status box, settings embedded in each file.
+
 ## Requirements
 - Windows 10/11, 64-bit
 - **NVIDIA GPU** (8 GB VRAM is the tuned target; more is fine).
@@ -35,8 +43,16 @@ fetch_models.py     → downloads weights into acestep_engine/checkpoints
 auragroove.py       → the Gradio UI (orchestration layer)
 worker.py           → persistent generation worker (imports acestep, holds model)
 acestep_engine/     → vendored ACE-Step 1.5 (engine) + patched cli.py
+train_lora.bat      → fine-tune a LoRA on your own tracks (see finetune/)
+finetune/           → dataset prep + LoRA training + merge scripts
 make_release.ps1    → stage a clean copy (no venv) to move to another PC
 ```
+
+## Fine-tune on your own music (LoRA)
+Train a small adapter so generations lean toward your sound, then run it on the
+fast turbo path. Drop your tracks in `finetune/dataset/` and double-click
+**`train_lora.bat`** (it scaffolds a dataset file, then trains + bakes a ready
+checkpoint you select in the **DiT Model** dropdown). Full guide: [`finetune/README.md`](finetune/README.md).
 
 ## Credits & licenses
 - **Auragroove** wrapper code: MIT (see `LICENSE`).
