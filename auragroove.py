@@ -383,9 +383,10 @@ def _ensure_worker(model, vae="official", lm="none", lora="none", offload=True):
     """Spawn/respawn the worker if needed. Returns load_time if a (re)spawn
     happened this call, else None (worker was already resident)."""
     global _worker, _worker_model, _worker_offload, _worker_vae, _worker_lm, _worker_lora, _worker_gens, _worker_baseline_rss
-    # Per-model precision: the distilled TURBO survives INT8 (fast, resident). The
-    # non-distilled BASE/SFT models get corrupted by INT8 (errors compound over 50
-    # steps + CFG), so run them in full precision with CPU-offload to still fit 8GB.
+    # Per-model precision: the distilled TURBO survives INT8 (fast, resident) — and
+    # runtime LoRAs apply fine on top of it. The non-distilled BASE/SFT models get
+    # corrupted by INT8 (errors compound over 50 steps + CFG), so they run in full
+    # precision with CPU-offload to still fit 8GB.
     is_turbo = "turbo" in (model or "").lower()
     quant = WORKER_QUANTIZATION if is_turbo else "none"
     offload_eff = WORKER_OFFLOAD_TO_CPU if is_turbo else True

@@ -36,27 +36,48 @@ Run **`train_lora.bat`** again (or directly):
 
 ```bat
 acestep_engine\.venv\Scripts\python.exe finetune\run_finetune.py ^
-    --dataset-json finetune\dataset.json --name myphonk ^
-    --variant base --rank 16 --epochs 30
+    --dataset-json finetune\dataset.json --name myphonk_turbo ^
+    --variant turbo --tensors finetune\cache\tensors_turbo ^
+    --rank 16 --epochs 30 --max-duration 30
 ```
 
-It will: download the **base** model the first time (several GB) → preprocess your
-audio into tensors → train the LoRA. The adapter is saved to
-`finetune/loras/myphonk/`.
+It preprocesses your audio into tensors → trains the LoRA on **turbo** (the
+reliable, fast path on 8 GB). The adapter is saved to
+`finetune/loras/myphonk_turbo/`.
+
+> Why turbo, not base? On 8 GB the base model must be INT8-quantized to fit, and
+> INT8 corrupts the non-distilled base (garbled output). Turbo is built for INT8,
+> and runtime LoRAs apply cleanly on top of it.
 
 ## 4. Use it
-Restart `run_auragroove.bat`, open **🎛 LoRA**, pick `myphonk`, set the strength,
-and generate. (Selecting/changing a LoRA reloads the worker once.)
+Restart `run_auragroove.bat`. Keep **DiT Model = `acestep-v15-turbo`** (stock),
+open **🎛 LoRA**, pick **`myphonk_turbo`**, and set the strength slider. Put your
+trigger word (`agphonk`) in the caption and generate. (Changing the LoRA reloads
+the worker once.) Runtime LoRAs apply fine on the fast INT8 turbo path.
+
+### Optional: bake it into a standalone model
+If you'd rather have a single model with the style baked in (e.g. to share/ship),
+merge the adapter into a checkpoint:
+
+```bat
+acestep_engine\.venv\Scripts\python.exe finetune\merge_lora.py ^
+    --lora finetune\loras\myphonk_turbo\final --src-variant turbo ^
+    --out-name acestep-v15-turbo-myphonk
+```
+
+Then pick `acestep-v15-turbo-myphonk` in **DiT Model** with **LoRA = none**.
+(Don't use both at once or the style is applied twice.)
 
 ## Tuning & 8 GB tips
-- **Out of memory?** Lower `--max-duration` (e.g. 30), keep `--rank 16`, base model.
+- **Out of memory?** Lower `--max-duration` (e.g. 20), keep `--rank 16`.
 - **Overfitting** (everything sounds identical / artefacts): fewer `--epochs`
-  (15–25), lower `--rank` (8–16), or generate with a lower LoRA strength.
+  (15–25), lower `--rank` (8–16), or drop the LoRA **strength** at generation.
 - **Underfitting** (no effect): more epochs, higher strength, or `--rank 32`.
-- `--variant base` (50-step, higher quality) vs `--variant turbo` (8-step, fast).
 - Re-run with `--skip-preprocess` to reuse cached tensors and just retrain.
 
 ## Notes
-- Training runs on the **base** model; you can still generate with turbo at
-  inference — but a LoRA trained on base is intended to be used on base.
+- Train on **turbo** and use it via the **LoRA dropdown** on the stock turbo
+  model — runtime LoRAs apply fine on turbo's INT8 path (fast).
+- Base (`--variant base`) is higher quality in theory but on 8 GB its required
+  INT8 quantization corrupts output — avoid it on this card.
 - `finetune/dataset/`, `finetune/cache/`, and `finetune/loras/` are git-ignored.

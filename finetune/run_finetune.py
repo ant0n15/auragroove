@@ -54,18 +54,19 @@ def main():
                     help="dataset.json from prepare_dataset.py")
     ap.add_argument("--audio-dir", default=None,
                     help="Alternative to --dataset-json: a folder of audio (filename=caption)")
-    ap.add_argument("--name", default="myphonk", help="Name for the output LoRA")
-    ap.add_argument("--variant", default="base", choices=["base", "turbo", "sft"],
-                    help="Which model to attach the LoRA to (base recommended)")
+    ap.add_argument("--name", default="myphonk_turbo", help="Name for the output LoRA")
+    ap.add_argument("--variant", default="turbo", choices=["base", "turbo", "sft"],
+                    help="Which model to train on (turbo recommended for 8GB; base "
+                         "is corrupted by the INT8 it needs to fit)")
     ap.add_argument("--rank", type=int, default=16, help="LoRA rank (16-32; lower = less overfit)")
     ap.add_argument("--alpha", type=int, default=16, help="LoRA alpha (scaling = alpha/rank)")
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     ap.add_argument("--epochs", type=int, default=30, help="Max epochs")
     ap.add_argument("--save-every", type=int, default=10, help="Checkpoint every N epochs")
-    ap.add_argument("--max-duration", type=float, default=60.0,
+    ap.add_argument("--max-duration", type=float, default=30.0,
                     help="Max seconds per clip in preprocessing (lower if you OOM)")
-    ap.add_argument("--tensors", default="finetune/cache/tensors", help="Preprocessed tensor dir")
+    ap.add_argument("--tensors", default="finetune/cache/tensors_turbo", help="Preprocessed tensor dir")
     ap.add_argument("--skip-preprocess", action="store_true",
                     help="Reuse existing tensors in --tensors (skip the encode step)")
     args = ap.parse_args()

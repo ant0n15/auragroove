@@ -7,16 +7,22 @@ $dst = Join-Path (Split-Path $src -Parent) "auragroove_release"
 
 Write-Host "Staging a clean copy to:" -ForegroundColor Cyan
 Write-Host "  $dst"
-Write-Host "Excluding: acestep_engine\.venv, __pycache__, auragroove_outputs, .git"
-Write-Host "(The 11.6 GB model weights ARE included.)"
+Write-Host "Excluding: acestep_engine\.venv, __pycache__, auragroove_outputs, .git,"
+Write-Host "           finetune\dataset, finetune\cache, finetune\loras"
+Write-Host "(The model weights ARE included, incl. any merged LoRA checkpoints.)"
 Write-Host ""
 
 $venv = Join-Path $src "acestep_engine\.venv"
 $outs = Join-Path $src "auragroove_outputs"
 $git  = Join-Path $src ".git"
+# Fine-tuning artifacts: your source audio, the tensor cache, and raw adapters.
+# Not needed to RUN (the merged checkpoint under checkpoints\ carries the style).
+$ftData  = Join-Path $src "finetune\dataset"
+$ftCache = Join-Path $src "finetune\cache"
+$ftLoras = Join-Path $src "finetune\loras"
 
 # robocopy returns 0-7 on success; treat >=8 as a real error.
-robocopy $src $dst /E /XD $venv $outs $git "__pycache__" /XF "*.pyc" `
+robocopy $src $dst /E /XD $venv $outs $git $ftData $ftCache $ftLoras "__pycache__" /XF "*.pyc" `
     /MT:16 /NFL /NDL /NJH /NP /R:1 /W:1 | Out-Null
 if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (code $LASTEXITCODE)"; exit 1 }
 

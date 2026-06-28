@@ -49,10 +49,11 @@ make_release.ps1    → stage a clean copy (no venv) to move to another PC
 ```
 
 ## Fine-tune on your own music (LoRA)
-Train a small adapter so generations lean toward your sound, then run it on the
-fast turbo path. Drop your tracks in `finetune/dataset/` and double-click
-**`train_lora.bat`** (it scaffolds a dataset file, then trains + bakes a ready
-checkpoint you select in the **DiT Model** dropdown). Full guide: [`finetune/README.md`](finetune/README.md).
+Train a small adapter so generations lean toward your sound, then load it from the
+**🎛 LoRA** dropdown (runtime, with a strength slider — applies fine on the fast
+turbo path). Drop your tracks in `finetune/dataset/` and double-click
+**`train_lora.bat`** (it scaffolds a dataset file, then trains the LoRA). Full
+guide: [`finetune/README.md`](finetune/README.md).
 
 ## Credits & licenses
 - **Auragroove** wrapper code: MIT (see `LICENSE`).
