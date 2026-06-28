@@ -1,0 +1,4 @@
+# Windows batch files must use CRLF or cmd.exe mis-parses multi-line blocks
+# (symptom: double-clicking the .bat "does nothing").
+*.bat text eol=crlf
+*.cmd text eol=crlf
