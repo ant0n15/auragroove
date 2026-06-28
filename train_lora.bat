@@ -29,9 +29,23 @@ if not exist "%~dp0finetune\dataset.json" (
     exit /b 0
 )
 
-REM ---- Step 2: preprocess + train the LoRA ----
+REM ---- Step 2: preprocess + train the LoRA on TURBO ----
+REM (turbo is the reliable path on 8GB; base gets corrupted by the INT8 needed to fit)
 echo.
-echo Training LoRA from finetune\dataset.json ...
-"%PY%" "%~dp0finetune\run_finetune.py" --dataset-json "%~dp0finetune\dataset.json" --name myphonk --variant base --rank 16 --epochs 30
+echo Training LoRA (turbo) from finetune\dataset.json ...
+"%PY%" "%~dp0finetune\run_finetune.py" --dataset-json "%~dp0finetune\dataset.json" --name myphonk_turbo --variant turbo --tensors "%~dp0finetune\cache\tensors_turbo" --rank 16 --epochs 30 --max-duration 30
+if errorlevel 1 ( echo Training failed - see messages above. & pause & exit /b 1 )
+
+REM ---- Step 3: bake the LoRA into a standalone turbo checkpoint ----
 echo.
+echo Baking the LoRA into a turbo checkpoint (acestep-v15-turbo-myphonk) ...
+"%PY%" "%~dp0finetune\merge_lora.py" --lora "%~dp0finetune\loras\myphonk_turbo\final" --src-variant turbo --out-name acestep-v15-turbo-myphonk
+if errorlevel 1 ( echo Merge failed - see messages above. & pause & exit /b 1 )
+
+echo.
+echo ================================================================
+echo  Done!  Restart run_auragroove.bat, then in the UI set
+echo  DiT Model = acestep-v15-turbo-myphonk  (LoRA = none).
+echo  Put your trigger word (agphonk) in the caption.
+echo ================================================================
 pause
